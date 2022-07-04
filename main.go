@@ -2,15 +2,16 @@ package main
 
 import (
 	"context"
+	"log"
+	"net/http"
+	"os"
+	"time"
+
 	"github.com/jessevdk/go-flags"
 	"github.com/machinebox/graphql"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
-	"log"
-	"net/http"
-	"os"
-	"time"
 )
 
 var opts struct {
@@ -93,6 +94,25 @@ var (
 			"type",
 			"currency",
 		})
+	lastPeriodProduction = promauto.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: namespace,
+			Name:      "previous_hour_production_watt_hour",
+			Help:      "Total Watt hours produced last hourly period",
+		},
+		[]string{
+			"home_id",
+		})
+	lastPeriodProfit = promauto.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: namespace,
+			Name:      "previous_hour_total_profit",
+			Help:      "Total profit last hourly period",
+		},
+		[]string{
+			"home_id",
+			"currency",
+		})
 )
 
 type Response struct {
@@ -144,6 +164,19 @@ type Response struct {
 					Currency        string    `json:"currency"`
 				} `json:"nodes"`
 			} `json:"consumption"`
+			Production struct {
+				Nodes []struct {
+					From           time.Time `json:"from"`
+					To             time.Time `json:"to"`
+					UnitCost       float64   `json:"unitCost"`
+					UnitPrice      float64   `json:"unitPrice"`
+					UnitPriceVAT   float64   `json:"unitPriceVAT"`
+					Production     float64   `json:"production"`
+					ProductionUnit string    `json:"productionUnit"`
+					Profit         float64   `json:"profit"`
+					Currency       string    `json:"currency"`
+				} `json:"nodes"`
+			} `json:"production"`
 		} `json:"homes"`
 	} `json:"viewer"`
 }
@@ -179,64 +212,87 @@ func updatePrometheus(response Response, scrapeDuration float64) {
 			lastPeriodPrice.WithLabelValues(home.Id, "vat", node.Currency).Set(node.UnitPriceVAT)
 			lastPeriodTotalCost.WithLabelValues(home.Id, node.Currency).Set(node.TotalCost)
 		}
-	}
 
+		if len(home.Production.Nodes) > 0 {
+			node := home.Production.Nodes[0]
+			if node.ProductionUnit != "kWh" {
+				log.Printf("Expected unit kWh, but got %s\n", node.ProductionUnit)
+			}
+			// Use base unit; Wh instead of kWh
+			lastPeriodProduction.WithLabelValues(home.Id).Set(node.Production / 1000)
+			lastPeriodPrice.WithLabelValues(home.Id, "energy", node.Currency).Set(node.UnitPrice)
+			lastPeriodPrice.WithLabelValues(home.Id, "vat", node.Currency).Set(node.UnitPriceVAT)
+			lastPeriodProfit.WithLabelValues(home.Id, node.Currency).Set(node.Profit)
+		}
+	}
 }
 
 func scrape() Response {
 	req := graphql.NewRequest(`
 {
-  viewer {
-    name
-    homes {
-      id
-      timeZone
-      address {
-        address1
-		address2
-		address3
-        city
-        postalCode
-		country
-		latitude
-		longitude
-      }
-      owner {
-        firstName
-        lastName
-        contactInfo {
-          email
-          mobile
-        }
-      }
-      currentSubscription{
-        priceInfo{
-          current{
-            total
-            energy
-            tax
-            currency
-            startsAt
-            level
-          }
-        }
-      }
-      consumption(resolution: HOURLY, last: 1) {
-        nodes {
-          from
-          to
-          totalCost
-          unitCost
-          unitPrice
-          unitPriceVAT
-          consumption
-          consumptionUnit
-          currency
-        }
-      }
-    }
-  }
-}
+	viewer {
+		name
+		homes {
+		id
+		timeZone
+		address {
+			address1
+			address2
+			address3
+			city
+			postalCode
+			country
+			latitude
+			longitude
+		}
+		owner {
+			firstName
+			lastName
+			contactInfo {
+			email
+			mobile
+			}
+		}
+		currentSubscription{
+			priceInfo{
+			current{
+				total
+				energy
+				tax
+				currency
+				startsAt
+				level
+			}
+			}
+		}
+		consumption(resolution: HOURLY, last: 1) {
+			nodes {
+			from
+			to
+			totalCost
+			unitCost
+			unitPrice
+			unitPriceVAT
+			consumption
+			consumptionUnit
+			currency
+			}
+		}
+		production(resolution: HOURLY, last: 1) {
+			nodes {
+			from
+			to
+			unitPrice
+			unitPriceVAT
+			production
+			productionUnit
+			profit
+			currency
+			}
+		}
+		}
+	}
+	}
 `)
 	req.Header.Set("Authorization", opts.Token)
 	ctx := context.Background()
